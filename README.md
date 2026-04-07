@@ -36,11 +36,30 @@ This legal test has generally "been applied in subsequent [copyright law] decisi
 
 https://en.wikipedia.org/wiki/Analytic_dissection
 
+"§107. Limitations on exclusive rights: Fair use
+Notwithstanding the provisions of sections 106 and 106A, the fair use of a copyrighted work, including such use by reproduction in copies or phonorecords or by any other means specified by that section, for purposes such as criticism, comment, news reporting, teaching (including multiple copies for classroom use), scholarship, or research, is not an infringement of copyright. In determining whether the use made of a work in any particular case is a fair use the factors to be considered shall include-
+
+(1) the purpose and character of the use, including whether such use is of a commercial nature or is for nonprofit educational purposes;
+
+(2) the nature of the copyrighted work;
+
+(3) the amount and substantiality of the portion used in relation to the copyrighted work as a whole; and
+
+(4) the effect of the use upon the potential market for or value of the copyrighted work." -- https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title17-section107&num=0&edition=prelim
+
+"Is a software company entitled to copyright protection for its unique programming platform; and, if so, under what conditions does a secondary use of that programming platform to create a new computer program constitute fair use?" -- https://www.law.cornell.edu/category/keywords/merger_doctrine
+
 https://en.wikipedia.org/wiki/Abstraction-Filtration-Comparison_test#
 
 https://en.wikipedia.org/wiki/Structure,_sequence_and_organization
 
 https://en.wikipedia.org/wiki/Idea%E2%80%93expression_distinction#Merger_doctrine
+
+https://www.copyright.gov/rulings-filings/briefs/google-llc-v-oracleamerica-inc-no-18-956-2020.pdf
+
+https://www.congress.gov/crs-product/LSB10597
+
+https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title17-section107&num=0&edition=prelim
 
 https://www.ce9.uscourts.gov/jury-instructions/node/276
 
