@@ -10,6 +10,7 @@ import type { Tools } from '../../../Tool.js'
 import type { Options } from '../claude.js'
 import type { ThinkingConfig } from '../../../utils/context.js'
 import WebSocket from 'ws'
+import { randomUUID } from 'crypto'
 
 function mapAnthropicToolsToOpenAI(tools: Tools) {
   return tools.map(tool => ({
@@ -184,7 +185,7 @@ export async function* queryModelWithWebSocket({
             if (!currentAssistantMessage) {
               currentAssistantMessage = {
                 type: 'assistant',
-                uuid: event.item.id || 'assistant-message-' + Math.random().toString(36).substring(7),
+                uuid: event.item.id || 'assistant-message-' + randomUUID(),
                 message: {
                   role: 'assistant',
                   content: []
