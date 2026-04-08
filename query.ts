@@ -204,9 +204,9 @@ export type QueryParams = {
 type State = {
   messages: Message[]
   toolUseContext: ToolUseContext
-  autoCompactTracking: AutoCompactTrackingState | undefined
+  autoCompactTracking?: any
+  hasAttemptedReactiveCompact?: boolean
   maxOutputTokensRecoveryCount: number
-  hasAttemptedReactiveCompact: boolean
   maxOutputTokensOverride: number | undefined
   pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
   stopHookActive: boolean | undefined
@@ -214,6 +214,8 @@ type State = {
   // Why the previous iteration continued. Undefined on first iteration.
   // Lets tests assert recovery paths fired without inspecting message contents.
   transition: Continue | undefined
+  // For WebSocket mode
+  previous_response_id: string | undefined
 }
 
 export async function* query(
@@ -269,13 +271,14 @@ async function* queryLoop(
     messages: params.messages,
     toolUseContext: params.toolUseContext,
     maxOutputTokensOverride: params.maxOutputTokensOverride,
-    autoCompactTracking: undefined,
     stopHookActive: undefined,
     maxOutputTokensRecoveryCount: 0,
-    hasAttemptedReactiveCompact: false,
     turnCount: 1,
     pendingToolUseSummary: undefined,
     transition: undefined,
+    hasAttemptedReactiveCompact: false,
+    autoCompactTracking: undefined,
+    previous_response_id: undefined
   }
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
@@ -318,6 +321,7 @@ async function* queryLoop(
       pendingToolUseSummary,
       stopHookActive,
       turnCount,
+      previous_response_id,
     } = state
 
     // Skill discovery prefetch — per-iteration (uses findWritePivot guard
@@ -589,65 +593,8 @@ async function* queryLoop(
       ? createDumpPromptsFetch(toolUseContext.agentId ?? config.sessionId)
       : undefined
 
-    // Block if we've hit the hard blocking limit (only applies when auto-compact is OFF)
-    // This reserves space so users can still run /compact manually
-    // Skip this check if compaction just happened - the compaction result is already
-    // validated to be under the threshold, and tokenCountWithEstimation would use
-    // stale input_tokens from kept messages that reflect pre-compaction context size.
-    // Same staleness applies to snip: subtract snipTokensFreed (otherwise we'd
-    // falsely block in the window where snip brought us under autocompact threshold
-    // but the stale usage is still above blocking limit — before this PR that
-    // window never existed because autocompact always fired on the stale count).
-    // Also skip for compact/session_memory queries — these are forked agents that
-    // inherit the full conversation and would deadlock if blocked here (the compact
-    // agent needs to run to REDUCE the token count).
-    // Also skip when reactive compact is enabled and automatic compaction is
-    // allowed — the preempt's synthetic error returns before the API call,
-    // so reactive compact would never see a prompt-too-long to react to.
-    // Widened to walrus so RC can act as fallback when proactive fails.
-    //
-    // Same skip for context-collapse: its recoverFromOverflow drains
-    // staged collapses on a REAL API 413, then falls through to
-    // reactiveCompact. A synthetic preempt here would return before the
-    // API call and starve both recovery paths. The isAutoCompactEnabled()
-    // conjunct preserves the user's explicit "no automatic anything"
-    // config — if they set DISABLE_AUTO_COMPACT, they get the preempt.
-    let collapseOwnsIt = false
-    if (feature('CONTEXT_COLLAPSE')) {
-      collapseOwnsIt =
-        (contextCollapse?.isContextCollapseEnabled() ?? false) &&
-        isAutoCompactEnabled()
-    }
-    // Hoist media-recovery gate once per turn. Withholding (inside the
-    // stream loop) and recovery (after) must agree; CACHED_MAY_BE_STALE can
-    // flip during the 5-30s stream, and withhold-without-recover would eat
-    // the message. PTL doesn't hoist because its withholding is ungated —
-    // it predates the experiment and is already the control-arm baseline.
-    const mediaRecoveryEnabled =
-      reactiveCompact?.isReactiveCompactEnabled() ?? false
-    if (
-      !compactionResult &&
-      querySource !== 'compact' &&
-      querySource !== 'session_memory' &&
-      !(
-        reactiveCompact?.isReactiveCompactEnabled() && isAutoCompactEnabled()
-      ) &&
-      !collapseOwnsIt
-    ) {
-      const { isAtBlockingLimit } = calculateTokenWarningState(
-        tokenCountWithEstimation(messagesForQuery) - snipTokensFreed,
-        toolUseContext.options.mainLoopModel,
-      )
-      if (isAtBlockingLimit) {
-        yield createAssistantAPIErrorMessage({
-          content: PROMPT_TOO_LONG_ERROR_MESSAGE,
-          error: 'invalid_request',
-        })
-        return { reason: 'blocking_limit' }
-      }
-    }
-
     let attemptWithFallback = true
+    let new_previous_response_id = previous_response_id
 
     queryCheckpoint('query_api_loop_start')
     try {
@@ -656,13 +603,19 @@ async function* queryLoop(
         try {
           let streamingFallbackOccured = false
           queryCheckpoint('query_api_streaming_start')
+            // Compute the slice of messages to send if chaining via previous_response_id
+            const incrementalInput = previous_response_id
+              ? messagesForQuery.filter((m: any) => m.uuid && !toolUseContext.readFileState?.includes(m.uuid)) // using readFileState as a proxy for seen items for PoC purposes
+              : messagesForQuery
+
           for await (const message of deps.callModel({
-            messages: prependUserContext(messagesForQuery, userContext),
+              messages: prependUserContext(incrementalInput, userContext),
             systemPrompt: fullSystemPrompt,
             thinkingConfig: toolUseContext.options.thinkingConfig,
             tools: toolUseContext.options.tools,
             signal: toolUseContext.abortController.signal,
             options: {
+                ...({ previous_response_id } as any),
               async getToolPermissionContext() {
                 const appState = toolUseContext.getAppState()
                 return appState.toolPermissionContext
@@ -785,6 +738,12 @@ async function* queryLoop(
                 }
               }
             }
+            // Handle specific StreamEvents mapping to previous_response_id persistence
+            if (message.type === 'response_id') {
+              new_previous_response_id = message.id
+              continue
+            }
+
             // Withhold recoverable errors (prompt-too-long, max-output-tokens)
             // until we know whether recovery (collapse drain / reactive
             // compact / truncation retry) can succeed. Still pushed to
@@ -800,7 +759,7 @@ async function* queryLoop(
             if (feature('CONTEXT_COLLAPSE')) {
               if (
                 contextCollapse?.isWithheldPromptTooLong(
-                  message,
+                  message as AssistantMessage,
                   isPromptTooLongMessage,
                   querySource,
                 )
@@ -808,16 +767,10 @@ async function* queryLoop(
                 withheld = true
               }
             }
-            if (reactiveCompact?.isWithheldPromptTooLong(message)) {
+            if (reactiveCompact?.isWithheldPromptTooLong(message as AssistantMessage)) {
               withheld = true
             }
-            if (
-              mediaRecoveryEnabled &&
-              reactiveCompact?.isWithheldMediaSizeError(message)
-            ) {
-              withheld = true
-            }
-            if (isWithheldMaxOutputTokens(message)) {
+            if (isWithheldMaxOutputTokens(message as AssistantMessage)) {
               withheld = true
             }
             if (!withheld) {
@@ -1062,126 +1015,6 @@ async function* queryLoop(
     if (!needsFollowUp) {
       const lastMessage = assistantMessages.at(-1)
 
-      // Prompt-too-long recovery: the streaming loop withheld the error
-      // (see withheldByCollapse / withheldByReactive above). Try collapse
-      // drain first (cheap, keeps granular context), then reactive compact
-      // (full summary). Single-shot on each — if a retry still 413's,
-      // the next stage handles it or the error surfaces.
-      const isWithheld413 =
-        lastMessage?.type === 'assistant' &&
-        lastMessage.isApiErrorMessage &&
-        isPromptTooLongMessage(lastMessage)
-      // Media-size rejections (image/PDF/many-image) are recoverable via
-      // reactive compact's strip-retry. Unlike PTL, media errors skip the
-      // collapse drain — collapse doesn't strip images. mediaRecoveryEnabled
-      // is the hoisted gate from before the stream loop (same value as the
-      // withholding check — these two must agree or a withheld message is
-      // lost). If the oversized media is in the preserved tail, the
-      // post-compact turn will media-error again; hasAttemptedReactiveCompact
-      // prevents a spiral and the error surfaces.
-      const isWithheldMedia =
-        mediaRecoveryEnabled &&
-        reactiveCompact?.isWithheldMediaSizeError(lastMessage)
-      if (isWithheld413) {
-        // First: drain all staged context-collapses. Gated on the PREVIOUS
-        // transition not being collapse_drain_retry — if we already drained
-        // and the retry still 413'd, fall through to reactive compact.
-        if (
-          feature('CONTEXT_COLLAPSE') &&
-          contextCollapse &&
-          state.transition?.reason !== 'collapse_drain_retry'
-        ) {
-          const drained = contextCollapse.recoverFromOverflow(
-            messagesForQuery,
-            querySource,
-          )
-          if (drained.committed > 0) {
-            const next: State = {
-              messages: drained.messages,
-              toolUseContext,
-              autoCompactTracking: tracking,
-              maxOutputTokensRecoveryCount,
-              hasAttemptedReactiveCompact,
-              maxOutputTokensOverride: undefined,
-              pendingToolUseSummary: undefined,
-              stopHookActive: undefined,
-              turnCount,
-              transition: {
-                reason: 'collapse_drain_retry',
-                committed: drained.committed,
-              },
-            }
-            state = next
-            continue
-          }
-        }
-      }
-      if ((isWithheld413 || isWithheldMedia) && reactiveCompact) {
-        const compacted = await reactiveCompact.tryReactiveCompact({
-          hasAttempted: hasAttemptedReactiveCompact,
-          querySource,
-          aborted: toolUseContext.abortController.signal.aborted,
-          messages: messagesForQuery,
-          cacheSafeParams: {
-            systemPrompt,
-            userContext,
-            systemContext,
-            toolUseContext,
-            forkContextMessages: messagesForQuery,
-          },
-        })
-
-        if (compacted) {
-          // task_budget: same carryover as the proactive path above.
-          // messagesForQuery still holds the pre-compact array here (the
-          // 413-failed attempt's input).
-          if (params.taskBudget) {
-            const preCompactContext =
-              finalContextTokensFromLastResponse(messagesForQuery)
-            taskBudgetRemaining = Math.max(
-              0,
-              (taskBudgetRemaining ?? params.taskBudget.total) -
-                preCompactContext,
-            )
-          }
-
-          const postCompactMessages = buildPostCompactMessages(compacted)
-          for (const msg of postCompactMessages) {
-            yield msg
-          }
-          const next: State = {
-            messages: postCompactMessages,
-            toolUseContext,
-            autoCompactTracking: undefined,
-            maxOutputTokensRecoveryCount,
-            hasAttemptedReactiveCompact: true,
-            maxOutputTokensOverride: undefined,
-            pendingToolUseSummary: undefined,
-            stopHookActive: undefined,
-            turnCount,
-            transition: { reason: 'reactive_compact_retry' },
-          }
-          state = next
-          continue
-        }
-
-        // No recovery — surface the withheld error and exit. Do NOT fall
-        // through to stop hooks: the model never produced a valid response,
-        // so hooks have nothing meaningful to evaluate. Running stop hooks
-        // on prompt-too-long creates a death spiral: error → hook blocking
-        // → retry → error → … (the hook injects more tokens each cycle).
-        yield lastMessage
-        void executeStopFailureHooks(lastMessage, toolUseContext)
-        return { reason: isWithheldMedia ? 'image_error' : 'prompt_too_long' }
-      } else if (feature('CONTEXT_COLLAPSE') && isWithheld413) {
-        // reactiveCompact compiled out but contextCollapse withheld and
-        // couldn't recover (staged queue empty/stale). Surface. Same
-        // early-return rationale — don't fall through to stop hooks.
-        yield lastMessage
-        void executeStopFailureHooks(lastMessage, toolUseContext)
-        return { reason: 'prompt_too_long' }
-      }
-
       // Check for max_output_tokens and inject recovery message. The error
       // was withheld from the stream above; only surface it if recovery
       // exhausts.
@@ -1207,14 +1040,13 @@ async function* queryLoop(
           const next: State = {
             messages: messagesForQuery,
             toolUseContext,
-            autoCompactTracking: tracking,
             maxOutputTokensRecoveryCount,
-            hasAttemptedReactiveCompact,
             maxOutputTokensOverride: ESCALATED_MAX_TOKENS,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
             turnCount,
             transition: { reason: 'max_output_tokens_escalate' },
+            previous_response_id: previous_response_id
           }
           state = next
           continue
@@ -1235,9 +1067,7 @@ async function* queryLoop(
               recoveryMessage,
             ],
             toolUseContext,
-            autoCompactTracking: tracking,
             maxOutputTokensRecoveryCount: maxOutputTokensRecoveryCount + 1,
-            hasAttemptedReactiveCompact,
             maxOutputTokensOverride: undefined,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
@@ -1246,6 +1076,7 @@ async function* queryLoop(
               reason: 'max_output_tokens_recovery',
               attempt: maxOutputTokensRecoveryCount + 1,
             },
+            previous_response_id: previous_response_id
           }
           state = next
           continue
@@ -1287,71 +1118,16 @@ async function* queryLoop(
             ...stopHookResult.blockingErrors,
           ],
           toolUseContext,
-          autoCompactTracking: tracking,
           maxOutputTokensRecoveryCount: 0,
-          // Preserve the reactive compact guard — if compact already ran and
-          // couldn't recover from prompt-too-long, retrying after a stop-hook
-          // blocking error will produce the same result. Resetting to false
-          // here caused an infinite loop: compact → still too long → error →
-          // stop hook blocking → compact → … burning thousands of API calls.
-          hasAttemptedReactiveCompact,
           maxOutputTokensOverride: undefined,
           pendingToolUseSummary: undefined,
           stopHookActive: true,
           turnCount,
           transition: { reason: 'stop_hook_blocking' },
+          previous_response_id: previous_response_id
         }
         state = next
         continue
-      }
-
-      if (feature('TOKEN_BUDGET')) {
-        const decision = checkTokenBudget(
-          budgetTracker!,
-          toolUseContext.agentId,
-          getCurrentTurnTokenBudget(),
-          getTurnOutputTokens(),
-        )
-
-        if (decision.action === 'continue') {
-          incrementBudgetContinuationCount()
-          logForDebugging(
-            `Token budget continuation #${decision.continuationCount}: ${decision.pct}% (${decision.turnTokens.toLocaleString()} / ${decision.budget.toLocaleString()})`,
-          )
-          state = {
-            messages: [
-              ...messagesForQuery,
-              ...assistantMessages,
-              createUserMessage({
-                content: decision.nudgeMessage,
-                isMeta: true,
-              }),
-            ],
-            toolUseContext,
-            autoCompactTracking: tracking,
-            maxOutputTokensRecoveryCount: 0,
-            hasAttemptedReactiveCompact: false,
-            maxOutputTokensOverride: undefined,
-            pendingToolUseSummary: undefined,
-            stopHookActive: undefined,
-            turnCount,
-            transition: { reason: 'token_budget_continuation' },
-          }
-          continue
-        }
-
-        if (decision.completionEvent) {
-          if (decision.completionEvent.diminishingReturns) {
-            logForDebugging(
-              `Token budget early stop: diminishing returns at ${decision.completionEvent.pct}%`,
-            )
-          }
-          logEvent('tengu_token_budget_completed', {
-            ...decision.completionEvent,
-            queryChainId: queryChainIdForAnalytics,
-            queryDepth: queryTracking.depth,
-          })
-        }
       }
 
       return { reason: 'completed' }
@@ -1518,18 +1294,6 @@ async function* queryLoop(
     // If a hook indicated to prevent continuation, stop here
     if (shouldPreventContinuation) {
       return { reason: 'hook_stopped' }
-    }
-
-    if (tracking?.compacted) {
-      tracking.turnCounter++
-      logEvent('tengu_post_autocompact_turn', {
-        turnId:
-          tracking.turnId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-        turnCounter: tracking.turnCounter,
-
-        queryChainId: queryChainIdForAnalytics,
-        queryDepth: queryTracking.depth,
-      })
     }
 
     // Be careful to do this after tool calls are done, because the API
@@ -1712,17 +1476,17 @@ async function* queryLoop(
     }
 
     queryCheckpoint('query_recursive_call')
+
     const next: State = {
       messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
       toolUseContext: toolUseContextWithQueryTracking,
-      autoCompactTracking: tracking,
       turnCount: nextTurnCount,
       maxOutputTokensRecoveryCount: 0,
-      hasAttemptedReactiveCompact: false,
       pendingToolUseSummary: nextPendingToolUseSummary,
       maxOutputTokensOverride: undefined,
       stopHookActive,
       transition: { reason: 'next_turn' },
+      previous_response_id: new_previous_response_id
     }
     state = next
   } // while (true)
