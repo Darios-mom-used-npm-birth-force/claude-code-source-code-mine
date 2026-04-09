@@ -204,7 +204,7 @@ export type QueryParams = {
 type State = {
   messages: Message[]
   toolUseContext: ToolUseContext
-  autoCompactTracking?: AutoCompactTrackingState
+  autoCompactTracking?: any
   hasAttemptedReactiveCompact?: boolean
   maxOutputTokensRecoveryCount: number
   maxOutputTokensOverride: number | undefined
@@ -214,10 +214,8 @@ type State = {
   // Why the previous iteration continued. Undefined on first iteration.
   // Lets tests assert recovery paths fired without inspecting message contents.
   transition: Continue | undefined
-  // For WebSocket mode: tracks the OpenAI response ID from the last turn
-  previousResponseId: string | undefined
-  // Tracks UUIDs of messages already sent to the OpenAI Responses API
-  sentMessageUuids: Set<string>
+  // For WebSocket mode
+  previous_response_id: string | undefined
 }
 
 export async function* query(
@@ -280,8 +278,7 @@ async function* queryLoop(
     transition: undefined,
     hasAttemptedReactiveCompact: false,
     autoCompactTracking: undefined,
-    previousResponseId: undefined,
-    sentMessageUuids: new Set<string>(),
+    previous_response_id: undefined
   }
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
@@ -324,8 +321,7 @@ async function* queryLoop(
       pendingToolUseSummary,
       stopHookActive,
       turnCount,
-      previousResponseId,
-      sentMessageUuids,
+      previous_response_id,
     } = state
 
     // Skill discovery prefetch — per-iteration (uses findWritePivot guard
@@ -598,7 +594,7 @@ async function* queryLoop(
       : undefined
 
     let attemptWithFallback = true
-    let newPreviousResponseId = previousResponseId
+    let new_previous_response_id = previous_response_id
 
     queryCheckpoint('query_api_loop_start')
     try {
@@ -607,10 +603,9 @@ async function* queryLoop(
         try {
           let streamingFallbackOccured = false
           queryCheckpoint('query_api_streaming_start')
-            // Compute the slice of messages to send if chaining via previousResponseId:
-            // only send messages whose UUIDs have not yet been acknowledged by the API.
-            const incrementalInput = previousResponseId
-              ? messagesForQuery.filter((m) => !m.uuid || !sentMessageUuids.has(m.uuid))
+            // Compute the slice of messages to send if chaining via previous_response_id
+            const incrementalInput = previous_response_id
+              ? messagesForQuery.filter((m: any) => m.uuid && !toolUseContext.readFileState?.includes(m.uuid)) // using readFileState as a proxy for seen items for PoC purposes
               : messagesForQuery
 
           for await (const message of deps.callModel({
@@ -620,7 +615,7 @@ async function* queryLoop(
             tools: toolUseContext.options.tools,
             signal: toolUseContext.abortController.signal,
             options: {
-                ...({ previousResponseId } as any),
+                ...({ previous_response_id } as any),
               async getToolPermissionContext() {
                 const appState = toolUseContext.getAppState()
                 return appState.toolPermissionContext
@@ -743,13 +738,9 @@ async function* queryLoop(
                 }
               }
             }
-            // Handle specific StreamEvents mapping to previousResponseId persistence
+            // Handle specific StreamEvents mapping to previous_response_id persistence
             if (message.type === 'response_id') {
-              newPreviousResponseId = message.id
-              // Track all message UUIDs sent so far as "acknowledged"
-              for (const m of incrementalInput) {
-                if (m.uuid) sentMessageUuids.add(m.uuid)
-              }
+              new_previous_response_id = message.id
               continue
             }
 
@@ -1055,8 +1046,7 @@ async function* queryLoop(
             stopHookActive: undefined,
             turnCount,
             transition: { reason: 'max_output_tokens_escalate' },
-            previousResponseId: previousResponseId,
-            sentMessageUuids,
+            previous_response_id: previous_response_id
           }
           state = next
           continue
@@ -1086,8 +1076,7 @@ async function* queryLoop(
               reason: 'max_output_tokens_recovery',
               attempt: maxOutputTokensRecoveryCount + 1,
             },
-            previousResponseId: previousResponseId,
-            sentMessageUuids,
+            previous_response_id: previous_response_id
           }
           state = next
           continue
@@ -1135,8 +1124,7 @@ async function* queryLoop(
           stopHookActive: true,
           turnCount,
           transition: { reason: 'stop_hook_blocking' },
-          previousResponseId: previousResponseId,
-          sentMessageUuids,
+          previous_response_id: previous_response_id
         }
         state = next
         continue
@@ -1498,8 +1486,7 @@ async function* queryLoop(
       maxOutputTokensOverride: undefined,
       stopHookActive,
       transition: { reason: 'next_turn' },
-      previousResponseId: newPreviousResponseId,
-      sentMessageUuids,
+      previous_response_id: new_previous_response_id
     }
     state = next
   } // while (true)
